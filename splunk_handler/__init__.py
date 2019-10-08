@@ -2,21 +2,14 @@ import atexit
 import json
 import logging
 import socket
-import sys
 import time
 import traceback
-
+from collections import deque
 from threading import Timer
 
 import requests
-from requests.packages.urllib3.util.retry import Retry
 from requests.adapters import HTTPAdapter
-
-is_py2 = sys.version[0] == '2'
-if is_py2:
-    from Queue import Queue, Full, Empty
-else:
-    from queue import Queue, Full, Empty
+from requests.packages.urllib3.util.retry import Retry
 
 instances = []  # For keeping track of running class instances
 
@@ -44,6 +37,7 @@ class SplunkHandler(logging.Handler):
     A logging handler to send events to a Splunk Enterprise instance
     running the Splunk HTTP Event Collector.
     """
+
     def __init__(self, host, port, token, index,
                  hostname=None, source=None, sourcetype='text',
                  verify=True, timeout=60, flush_interval=15.0,
@@ -69,7 +63,9 @@ class SplunkHandler(logging.Handler):
         self.timer = None
         self.testing = False  # Used for slightly altering logic during unit testing
         # It is possible to get 'behind' and never catch up, so we limit the queue size
-        self.queue = Queue(maxsize=queue_size)
+        self.queue = deque()
+        self.max_queue_size = queue_size
+        self.cur_queue_size = 0
         self.debug = debug
         self.session = requests.Session()
         self.retry_count = retry_count
@@ -97,20 +93,20 @@ class SplunkHandler(logging.Handler):
         # disable all warnings from urllib3 package
         if not self.verify:
             requests.packages.urllib3.disable_warnings()
-       
+
         if self.verify and self.protocol == 'http':
             print("[SplunkHandler DEBUG] " + 'cannot use SSL Verify and unsecure connection')
-       
+
         if self.proxies is not None:
             self.session.proxies = self.proxies
-           
+
         # Set up automatic retry with back-off
         self.write_debug_log("Preparing to create a Requests session")
         retry = Retry(total=self.retry_count,
                       backoff_factor=self.retry_backoff,
                       method_whitelist=False,  # Retry for any HTTP verb
                       status_forcelist=[500, 502, 503, 504])
-        self.session.mount(self.protocol+'://', HTTPAdapter(max_retries=retry))
+        self.session.mount(self.protocol + '://', HTTPAdapter(max_retries=retry))
 
         self.start_worker_thread()
 
@@ -127,11 +123,12 @@ class SplunkHandler(logging.Handler):
             return
 
         if self.flush_interval > 0:
-            try:
-                self.write_debug_log("Writing record to log queue")
-                # Put log message into queue; worker thread will pick up
-                self.queue.put_nowait(record)
-            except Full:
+            self.write_debug_log("Writing record to log queue")
+            # Put log message into queue; worker thread will pick up
+            if self.cur_queue_size < self.max_queue_size:
+                self.queue.append(record)
+                self.cur_queue_size += 1
+            else:
                 self.write_log("Log queue full; log data will be dropped.")
         else:
             # Flush log immediately; is blocking call
@@ -253,20 +250,15 @@ class SplunkHandler(logging.Handler):
                 self.write_debug_log("Timer thread scheduled")
 
     def empty_queue(self):
-        while not self.queue.empty():
-            self.write_debug_log("Recursing through queue")
-            try:
-                item = self.queue.get(block=False)
-                self.log_payload = self.log_payload + item
-                self.queue.task_done()
-                self.write_debug_log("Queue task completed")
-            except Empty:
-                self.write_debug_log("Queue was empty")
+        if len(self.queue) == 0:
+            self.write_debug_log("Queue was empty")
+            return True
 
-            # If the payload is getting very long, stop reading and send immediately.
-            if not self.SIGTERM and len(self.log_payload) >= 524288:  # 50MB
-                self.write_debug_log("Payload maximum size exceeded, sending immediately")
-                return False
+        # TODO: break on 50 MB?
+        self.write_debug_log("Recursing through queue")
+        self.log_payload = self.log_payload + ''.join(list(self.queue))
+        self.queue.clear()
+        self.write_debug_log("Queue task completed")
 
         return True
 
