@@ -63,7 +63,7 @@ class SplunkHandler(logging.Handler):
         self.timer = None
         self.testing = False  # Used for slightly altering logic during unit testing
         # It is possible to get 'behind' and never catch up, so we limit the queue size
-        self.queue = deque()
+        self.queue = list()
         self.max_queue_size = queue_size
         self.cur_queue_size = 0
         self.debug = debug
@@ -241,7 +241,8 @@ class SplunkHandler(logging.Handler):
             else:
                 if not queue_is_empty:
                     self.write_debug_log("Queue not empty, scheduling timer to run immediately")
-                    timer_interval = 1.0  # Start up again right away if queue was not cleared
+                    # Start up again right away if queue was not cleared
+                    timer_interval = min(1.0, self.flush_interval/2)
 
                 self.write_debug_log("Resetting timer thread")
                 self.timer = Timer(timer_interval, self._splunk_worker)
@@ -254,13 +255,14 @@ class SplunkHandler(logging.Handler):
             self.write_debug_log("Queue was empty")
             return True
 
-        # TODO: break on 50 MB?
         self.write_debug_log("Recursing through queue")
-        self.log_payload = self.log_payload + ''.join(list(self.queue))
-        self.queue.clear()
+        apprx_size_base = len(self.queue[0])
+        count = int(524288 / apprx_size_base)
+        self.log_payload = self.log_payload + ''.join(self.queue[:count])
+        del self.queue[:count]
         self.write_debug_log("Queue task completed")
 
-        return True
+        return len(self.queue) > 0
 
     def force_flush(self):
         self.write_debug_log("Force flush requested")
